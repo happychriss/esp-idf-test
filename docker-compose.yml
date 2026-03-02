@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  dev:
+    container_name: "${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME in .env}-dev"
+
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+
+    working_dir: /workspace
+
+    volumes:
+      - .:/workspace:cached
+      # Claude config is stored in a named volume (scoped by COMPOSE_PROJECT_NAME).
+      # The repo's template lives at /workspace/claude-config and is seeded on first start.
+      - claude-home:/home/ubuntu/.claude
+      # Optional (broad): - /dev:/dev
+
+    devices:
+      - source: "${SERIAL_DEVICE:-/dev/ttyACM0}"
+        target: "/dev/ttyESP"
+
+    group_add:
+      - dialout   # besser: Host prüfen mit `getent group dialout`
+
+    privileged: true
+    init: true
+    tty: true
+    stdin_open: true
+
+volumes:
+  claude-home:
