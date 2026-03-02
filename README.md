@@ -65,6 +65,36 @@ Where to put Claude “memory / skills / MCP” files:
 - To ship defaults with this template, put them into [claude-config/](claude-config/) using the same paths you want under `~/.claude/`.
 - After the first start, changes persist in the project’s `claude-home` volume (so they stay isolated per copied template).
 
+## GitHub access — deploy key setup
+
+To allow Claude to push/pull from a single GitHub repo without touching your other repositories:
+
+**Inside the container:**
+```bash
+ssh-keygen -t ed25519 -C "my-project deploy key" -f ~/.ssh/my-project -N ""
+cat ~/.ssh/my-project.pub   # copy this
+```
+
+Add to `~/.ssh/config`:
+```
+Host github-my-project
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/my-project
+    IdentitiesOnly yes
+```
+
+**On GitHub** (browser): repo → Settings → Deploy keys → Add deploy key → paste public key → tick "Allow write access"
+
+**Test and set remote:**
+```bash
+ssh -T github-my-project    # should greet you with the repo name
+git remote add origin git@github-my-project:yourname/my-project.git
+git push -u origin main
+```
+
+The key is scoped to one repo only — it cannot access any of your other GitHub repositories.
+
 ## Optional: network allowlist (firewall)
 
 If you want to restrict outbound access to typical development endpoints (GitHub, npm registry, VS Code marketplace/update URLs, Anthropic API, etc.), run:
