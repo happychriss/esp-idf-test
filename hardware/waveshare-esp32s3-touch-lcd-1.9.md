@@ -62,12 +62,60 @@ mcu: ESP32-S3R8
 
 ## IMU — QMI8658A 6-DOF (I2C, shared bus with touch)
 
-| Signal   | GPIO |
-|----------|------|
-| SDA      | 47   |
-| SCL      | 48   |
-| IMU_INT1 | 8    |
-| IMU_INT2 | 7    |
+- Datasheet: `/workspace/external-docs/QMI8658A_Datasheet_Rev_A.pdf`
+- WHO_AM_I register: 0x00 → should return 0x05
+
+| Signal   | GPIO | Notes                        |
+|----------|------|------------------------------|
+| SDA      | 47   | shared with touch CST816S    |
+| SCL      | 48   | shared with touch CST816S    |
+| IMU_INT1 | 8    | RTC-capable, EXT1 wakeup     |
+| IMU_INT2 | 7    | RTC-capable                  |
+
+### ESP-IDF Driver (raw I2C — no registry component)
+
+- I2C address: **0x6B** (SA0=GND) — confirmed working
+- Uses shared `i2c_master_bus_handle_t` — init bus once, pass handle to both touch and IMU
+- No IMU init needed at boot — only configured when entering deep sleep
+
+### Wake-on-Motion (WoM) Configuration
+
+Key registers:
+| Register | Address | Purpose |
+|----------|---------|---------|
+| CTRL1    | 0x02    | INT pin enable (bit3=INT1_EN push-pull) |
+| CTRL2    | 0x03    | Accel ODR + full-scale |
+| CTRL7    | 0x08    | Sensor enable (bit0=aEN) |
+| CTRL8    | 0x09    | Motion routing (bit7=STATUSINT handshake) |
+| CTRL9    | 0x0A    | Host command register |
+| CAL1_L   | 0x0B    | WoM threshold (mg, 0x01–0xFF) |
+| CAL1_H   | 0x0C    | WoM INT pin + polarity |
+| STATUSINT| 0x2D    | bit7=CmdDone (poll for CTRL9 ACK) |
+
+WoM config sequence (confirmed working):
+1. CTRL7 = 0x00 (disable all sensors)
+2. CTRL1 = 0x08 (INT1 push-pull enabled)
+3. CTRL8 = 0x80 (use STATUSINT.bit7 for CTRL9 handshake, avoids INT1 conflict)
+4. CTRL2 = 0x27 (accel: ±8g, 128 Hz low-power)
+5. CAL1_L = 0xC0 (192 mg threshold — shake to wake; lower = more sensitive)
+6. CAL1_H = 0x20 (INT1 initial LOW, 32-sample blanking ≈ 250 ms — prevents config glitch wakeup)
+7. CTRL9 = 0x08 (CTRL_CMD_CONFIGURE_WOM)
+8. Poll STATUSINT until bit7 = 1
+9. CTRL9 = 0x00 (host ACK)
+10. CTRL7 = 0x01 (enable accel)
+11. Read STATUS1 (0x2F) to clear any pending WoM interrupt flag
+
+### Deep Sleep Wakeup (confirmed working)
+
+- EXT1 on GPIO8 (IMU_INT1), trigger = HIGH (`ESP_EXT1_WAKEUP_ANY_HIGH`)
+- **Must** configure RTC GPIO pull-down on GPIO8 before sleep — pin floats HIGH otherwise causing immediate wakeup:
+  ```c
+  rtc_gpio_init(8); rtc_gpio_set_direction(8, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pulldown_en(8); rtc_gpio_pullup_dis(8);
+  ```
+- Use `gpio_deep_sleep_hold_en()` to hold backlight GPIO14=1 (OFF) during sleep
+- `esp_sleep_get_wakeup_cause()` at boot: `ESP_SLEEP_WAKEUP_EXT1` = motion wake
+- Include `driver/rtc_io.h` — no extra CMakeLists REQUIRES needed (part of `esp_driver_gpio`)
 
 ## SD Card (SPI via JTAG pins)
 
