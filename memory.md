@@ -51,3 +51,29 @@ dependencies:
 **Key gotcha:** `lvgl_port_display_cfg_t.io_handle` is required — pass the SPI panel IO handle, not NULL.
 
 **LVGL 9 API (vs LVGL 8):** `lv_display_t*`, `lv_button_create()`, `lv_obj_remove_flag()`, `lv_display_get_screen_active(disp)`
+
+## Deep Sleep Current (confirmed measurements)
+
+- **Measuring at LiPo J1 JST connector: always ~2 mA** — ETA6098 BAT→SYS active quiescent, not firmware-controllable
+- `min_sleep_test` (4 stages) all identical ~2 mA → confirms ETA6098 is the floor
+- Firmware-controlled floor at 3.3V rail (bypass charger): **~220 µA** with EXT1+IMU WoM
+  - PSRAM ~140 µA (VDD_SPI stays on with EXT1), IMU 55 µA, ESP32 RTC 8 µA, buck 11 µA, LCD 7 µA
+- ETA6098 "1 µA at BAT" = shutdown mode only, NOT active BAT→SYS mode
+- Full details → `/workspace/hardware/waveshare-esp32s3-touch-lcd-1.9.md` Power section
+
+## Deep Sleep GPIO Hold Pattern (confirmed working, ESP32-S3)
+
+- Use `rtc_gpio_init()` + `rtc_gpio_set_level()` + `rtc_gpio_hold_en()` for output pins
+- Release at every boot: `rtc_gpio_hold_dis()` + `rtc_gpio_deinit()` before re-using as digital
+- Do NOT use `gpio_deep_sleep_hold_en()` — blocks EXT1 wakeup on GPIO8
+- EXT1 wakeup pin (GPIO8): `rtc_gpio_pulldown_en()` required — floats HIGH without it
+- Full pattern → `/workspace/skills/esp-idf-skills.md` sections 7–8
+
+## hello_world Firmware Features
+
+- HDC2080 temperature read at boot, displayed on UI (amber label)
+- CST816S touch in reset before sleep (GPIO17=0 held in RTC domain, ~0.2 µA)
+- QMI8658A WoM configured before sleep (55 µA, INT1 → EXT1 GPIO8)
+- ST7789V2 DISPOFF + SLPIN before sleep (~7 µA)
+- Backlight GPIO14=1 held in RTC domain
+- Wakeup cause shown at boot: "Cold Boot" vs "Motion"

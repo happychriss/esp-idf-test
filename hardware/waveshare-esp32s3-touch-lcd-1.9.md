@@ -32,6 +32,14 @@ mcu: ESP32-S3R8
 - `invert_color = true`
 - `set_gap(x=35, y=0)` — panel is offset 35 px in X
 
+### Deep Sleep Power Sequence (confirmed working)
+
+1. `gpio_set_level(LCD_BL_GPIO, 1)` — backlight off
+2. `esp_lcd_panel_disp_on_off(panel, false)` — DISPOFF (0x28)
+3. `esp_lcd_panel_io_tx_param(io, 0x10, NULL, 0)` — SLPIN (~17mA → ~7µA)
+4. `vTaskDelay(pdMS_TO_TICKS(5))` — wait for sleep-in
+5. `gpio_deep_sleep_hold_en()` — hold all GPIO output levels through sleep
+
 ### LVGL display flags (esp_lvgl_port v2)
 
 - `color_format = LV_COLOR_FORMAT_RGB565`
@@ -59,6 +67,11 @@ mcu: ESP32-S3R8
 - `levels.reset=0` (active-low reset), `levels.interrupt=0` (active-low INT)
 - `x_max=170`, `y_max=320`, no swap/mirror
 - panel_io_i2c: `control_phase_bytes=1`, `dc_bit_offset=0`, `lcd_cmd/param_bits=8`, `disable_control_phase=true`
+
+### Deep Sleep Power
+
+- Assert reset before sleep: `gpio_set_level(17, 0)` — ~0.2µA in reset vs ~2µA active
+- GPIO17 held low by `gpio_deep_sleep_hold_en()` (called after setting level)
 
 ## IMU — QMI8658A 6-DOF (I2C, shared bus with touch)
 
@@ -127,9 +140,50 @@ WoM config sequence (confirmed working):
 
 ## Power
 - USB-C → ETA6098 LiPo charger (max 2A)
+  - Shutdown quiescent (CE=0 or VIN=0 shutdown mode): **1 µA at BAT**
+  - **BAT→SYS active quiescent (no USB, board powered from LiPo): ~1–2 mA** — confirmed by measurement; this dominates deep sleep budget when powered from the LiPo/J1 connector
 - LiPo battery connector (J1 JST)
-- MP1605GTF-Z boost → 3.314V
+- MP1605GTF-Z buck (5V → 3.3V), quiescent: **11 µA**
 - BAT_ADC: GPIO4
+
+### Deep Sleep Current Budget (confirmed via firmware test + measurement)
+
+| Condition | Current | Notes |
+|-----------|---------|-------|
+| USB host (PC) connected | **~2 mA** | BBPLL kept alive by `CONFIG_RTC_CLOCK_BBPLL_POWER_ON_WITH_USB=y` |
+| LiPo/J1 connector (no USB), EXT1 + IMU WoM | **~2 mA** | ETA6098 BAT→SYS path quiescent dominates |
+| LiPo battery direct (bypassing ETA6098) | **~200–220 µA** | Firmware-controlled floor with IMU WoM |
+| Timer only + VDDSDIO off (no EXT1) | **~80 µA** | PSRAM powered off; incompatible with EXT1 |
+
+**Measurement notes:**
+- Measuring at the LiPo J1 JST connector includes the ETA6098 charger IC's BAT-mode
+  quiescent (~1–2 mA). This is NOT firmware-controllable.
+- `min_sleep_test` confirmed: all 4 stages (display active → SLPIN → touch reset → IMU WoM)
+  measured identical ~2 mA from the J1 connector. The firmware is correct; the ETA6098 is the floor.
+- To see the actual MCU/peripheral current, measure on the 3.3V rail directly (bypass the charger).
+- **Never measure with USB host (PC) connected** — BBPLL adds ~1–2 mA on top of everything.
+- Connecting to a USB *charger* (not a PC) does NOT trigger BBPLL — only live USB host enumeration does.
+
+### Firmware-controlled deep sleep floor (at 3.3V rail, EXT1 wakeup)
+
+| Component | Current |
+|-----------|---------|
+| ESP32-S3 RTC domain | ~8 µA |
+| PSRAM (VDD_SPI cannot power down with EXT1) | ~140 µA |
+| QMI8658A WoM 128 Hz Low-Power | ~55 µA |
+| ST7789V2 SLPIN | ~7 µA |
+| MP1605GTF-Z buck Iq | ~11 µA |
+| CST816S in reset (GPIO17=0) | ~0.2 µA |
+| **Total** | **~221 µA** |
+
+PSRAM breakdown: ESP32-S3R8 embeds 8 MB octal PSRAM on VDD_SPI rail shared with
+flash. With any GPIO/EXT1 wakeup source, VDD_SPI cannot be powered down → PSRAM
+draws **~140 µA** permanently (WROOM-1 datasheet Table 6-7).
+
+To disable BBPLL during sleep (breaks USB reconnect after wakeup):
+```
+CONFIG_RTC_CLOCK_BBPLL_POWER_ON_WITH_USB=n
+```
 
 ## System
 

@@ -1,6 +1,6 @@
 /*
- * Deep Sleep + IMU Wake-on-Motion
- * Waveshare ESP32-S3-Touch-LCD-1.9 (ST7789V2 + CST816S + QMI8658A)
+ * Deep Sleep + IMU Wake-on-Motion + HDC2080 Temperature
+ * Waveshare ESP32-S3-Touch-LCD-1.9 (ST7789V2 + CST816S + QMI8658A + HDC2080)
  * LVGL 9 / esp_lvgl_port v2
  */
 
@@ -71,20 +71,28 @@ static const char *TAG = "sleep_ui";
 #define QMI_STATUS1       0x2F   /* read to clear WoM interrupt flag */
 
 #define QMI_CMD_WOM       0x08   /* CTRL9: configure Wake-on-Motion */
+
 #define WOM_THRESHOLD_MG  0xC0   /* 192 mg — shake required to wake */
 #define WOM_BLANKING      0x20   /* 32 samples blanking (~250 ms at 128 Hz) */
+
+/* ---------- HDC2080 (external, shared I2C bus GPIO47/48) ---------- */
+#define HDC2080_I2C_ADDR  0x40   /* ADDR=GND; use 0x41 if ADDR=VDD */
+#define HDC2080_TEMP_L    0x00   /* Temperature LSB register */
+#define HDC2080_MEAS_CFG  0x0F   /* Measurement configuration register */
 
 /* ---------- Draw buffer ---------- */
 #define DRAW_BUF_LINES    32
 #define DRAW_BUF_SIZE     (LCD_H_RES * DRAW_BUF_LINES * sizeof(uint16_t))
 
 /* ---------- Globals ---------- */
-static esp_lcd_panel_handle_t  g_panel  = NULL;
-static i2c_master_bus_handle_t g_i2c_bus = NULL;
+static esp_lcd_panel_handle_t     g_panel   = NULL;
+static esp_lcd_panel_io_handle_t  g_lcd_io  = NULL;
+static i2c_master_bus_handle_t    g_i2c_bus = NULL;
 
-static lv_obj_t *g_label_wake  = NULL;
+static lv_obj_t *g_label_wake   = NULL;
+static lv_obj_t *g_label_temp   = NULL;
 static lv_obj_t *g_label_status = NULL;
-static lv_obj_t *g_btn_sleep   = NULL;
+static lv_obj_t *g_btn_sleep    = NULL;
 
 /* ==========================================================================
  * I2C bus
@@ -270,6 +278,66 @@ static void imu_configure_wom(i2c_master_bus_handle_t bus)
 }
 
 /* ==========================================================================
+ * HDC2080 — temperature/humidity (external, shared I2C bus)
+ * ======================================================================= */
+
+static float hdc2080_read_temp(i2c_master_bus_handle_t bus)
+{
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = HDC2080_I2C_ADDR,
+        .scl_speed_hz    = I2C_CLK_HZ,
+    };
+    i2c_master_dev_handle_t dev;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &dev));
+
+    /* Trigger T+RH measurement — 14-bit resolution, single-shot (AMM=0 default) */
+    uint8_t trig[2] = {HDC2080_MEAS_CFG, 0x01};
+    if (i2c_master_transmit(dev, trig, 2, 100) != ESP_OK) {
+        ESP_LOGW(TAG, "HDC2080: trigger failed — sensor not responding at 0x%02X", HDC2080_I2C_ADDR);
+        i2c_master_bus_rm_device(dev);
+        return -99.0f;
+    }
+
+    /* 14-bit T+RH conversion ≤ 13 ms; wait 15 ms for margin */
+    vTaskDelay(pdMS_TO_TICKS(15));
+
+    /* Read TEMP_L and TEMP_H */
+    uint8_t reg = HDC2080_TEMP_L;
+    uint8_t raw[2] = {0};
+    i2c_master_transmit(dev, &reg, 1, 100);
+    i2c_master_receive(dev, raw, 2, 100);
+
+    i2c_master_bus_rm_device(dev);
+
+    uint16_t raw16 = ((uint16_t)raw[1] << 8) | raw[0];
+    float temp = ((float)raw16 / 65536.0f) * 165.0f - 40.5f;
+    ESP_LOGI(TAG, "HDC2080: %.1f °C (raw=0x%04X)", temp, raw16);
+    return temp;
+}
+
+static void hdc2080_sleep(i2c_master_bus_handle_t bus)
+{
+    /* Device automatically sleeps after single-shot measurement.
+     * Write 0x00 to MEAS_CFG to guarantee no pending trigger before deep sleep. */
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = HDC2080_I2C_ADDR,
+        .scl_speed_hz    = I2C_CLK_HZ,
+    };
+    i2c_master_dev_handle_t dev;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &dev));
+    uint8_t cmd[2] = {HDC2080_MEAS_CFG, 0x00};
+    esp_err_t ret = i2c_master_transmit(dev, cmd, 2, 100);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "HDC2080 sleep: sensor not responding (err=%d)", ret);
+    } else {
+        ESP_LOGI(TAG, "HDC2080: sleep OK");
+    }
+    i2c_master_bus_rm_device(dev);
+}
+
+/* ==========================================================================
  * Sleep sequence
  * ======================================================================= */
 
@@ -278,24 +346,45 @@ static void enter_deep_sleep_cb(lv_timer_t *timer)
     (void)timer;
     ESP_LOGI(TAG, "Entering deep sleep");
 
-    /* Backlight off, hold GPIO state through deep sleep */
+    /* Backlight off immediately via digital GPIO */
     gpio_set_level(LCD_BL_GPIO, 1);
-    gpio_deep_sleep_hold_en();
 
-    /* Display off */
+    /* ST7789V2: display off then sleep-in (SLPIN 0x10 drops ~17mA → ~7µA) */
     esp_lcd_panel_disp_on_off(g_panel, false);
+    esp_lcd_panel_io_tx_param(g_lcd_io, 0x10, NULL, 0); /* SLPIN */
+    vTaskDelay(pdMS_TO_TICKS(5));
 
-    /* Configure IMU Wake-on-Motion */
+    /* CST816S: assert reset (active-low) */
+    gpio_set_level(TOUCH_RST_GPIO, 0);
+
+    /* HDC2080: ensure sleep before I2C bus is taken over by IMU config */
+    hdc2080_sleep(g_i2c_bus);
+
+    /* Configure IMU Wake-on-Motion (I2C — must complete before RTC domain changes) */
     imu_configure_wom(g_i2c_bus);
 
-    /* Pull GPIO8 LOW via RTC so it can't float HIGH during sleep */
+    /* GPIO8: RTC input with pulldown, EXT1 wakeup on IMU INT1 HIGH */
     rtc_gpio_init(IMU_INT1_GPIO);
     rtc_gpio_set_direction(IMU_INT1_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
     rtc_gpio_pulldown_en(IMU_INT1_GPIO);
     rtc_gpio_pullup_dis(IMU_INT1_GPIO);
-
-    /* EXT1 wakeup: GPIO8 (IMU INT1) HIGH */
     esp_sleep_enable_ext1_wakeup(1ULL << IMU_INT1_GPIO, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+    /* Move backlight and touch reset into RTC domain so they are held stably
+     * during sleep without interference from CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND.
+     * rtc_gpio_hold_en() is pin-specific and does NOT affect EXT1 on GPIO8.
+     * gpio_deep_sleep_hold_en() is intentionally NOT used — it would call
+     * gpio_hold_en() for ALL pads at sleep entry, which can interfere with
+     * RTC wakeup on GPIO8. */
+    rtc_gpio_init(LCD_BL_GPIO);
+    rtc_gpio_set_direction(LCD_BL_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level(LCD_BL_GPIO, 1);    /* OFF (active-low) */
+    rtc_gpio_hold_en(LCD_BL_GPIO);
+
+    rtc_gpio_init(TOUCH_RST_GPIO);
+    rtc_gpio_set_direction(TOUCH_RST_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level(TOUCH_RST_GPIO, 0); /* reset (active-low) */
+    rtc_gpio_hold_en(TOUCH_RST_GPIO);
 
     esp_deep_sleep_start();
 }
@@ -329,30 +418,37 @@ static void btn_sleep_event_cb(lv_event_t *e)
  * UI
  * ======================================================================= */
 
-static void ui_create(lv_display_t *disp, const char *wake_reason)
+static void ui_create(lv_display_t *disp, const char *wake_reason, const char *temp_str)
 {
     lv_obj_t *scr = lv_display_get_screen_active(disp);
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a2e), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
-    /* Wake reason label — top */
+    /* Wake reason label */
     g_label_wake = lv_label_create(scr);
     lv_label_set_text(g_label_wake, wake_reason);
     lv_obj_set_style_text_color(g_label_wake, lv_color_hex(0x00ffff), LV_PART_MAIN);
     lv_obj_set_style_text_font(g_label_wake, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(g_label_wake, LV_ALIGN_CENTER, 0, -50);
+    lv_obj_align(g_label_wake, LV_ALIGN_CENTER, 0, -80);
 
-    /* Status label — centre */
+    /* Temperature label */
+    g_label_temp = lv_label_create(scr);
+    lv_label_set_text(g_label_temp, temp_str);
+    lv_obj_set_style_text_color(g_label_temp, lv_color_hex(0xffaa00), LV_PART_MAIN);
+    lv_obj_set_style_text_font(g_label_temp, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(g_label_temp, LV_ALIGN_CENTER, 0, -40);
+
+    /* Status label */
     g_label_status = lv_label_create(scr);
     lv_label_set_text(g_label_status, "Lift to wake");
     lv_obj_set_style_text_color(g_label_status, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(g_label_status, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(g_label_status, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(g_label_status, LV_ALIGN_CENTER, 0, 10);
 
-    /* Sleep button — bottom */
+    /* Sleep button */
     g_btn_sleep = lv_button_create(scr);
     lv_obj_set_size(g_btn_sleep, 140, 40);
-    lv_obj_align(g_btn_sleep, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_align(g_btn_sleep, LV_ALIGN_CENTER, 0, 75);
     lv_obj_add_event_cb(g_btn_sleep, btn_sleep_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *btn_label = lv_label_create(g_btn_sleep);
@@ -367,6 +463,13 @@ static void ui_create(lv_display_t *disp, const char *wake_reason)
 
 void app_main(void)
 {
+    /* Release RTC GPIO holds from previous deep sleep (rtc_gpio_hold_en persists
+     * across wakeup; must release before re-initialising these pins as digital). */
+    rtc_gpio_hold_dis(LCD_BL_GPIO);
+    rtc_gpio_deinit(LCD_BL_GPIO);
+    rtc_gpio_hold_dis(TOUCH_RST_GPIO);
+    rtc_gpio_deinit(TOUCH_RST_GPIO);
+
     /* Determine wake reason */
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     const char *wake_str;
@@ -379,9 +482,17 @@ void app_main(void)
     /* Shared I2C bus */
     g_i2c_bus = i2c_bus_init();
 
+    /* HDC2080: read temperature before display init */
+    float temp_c = hdc2080_read_temp(g_i2c_bus);
+    char temp_str[24];
+    if (temp_c > -50.0f) {
+        snprintf(temp_str, sizeof(temp_str), "Temp: %.1f \xc2\xb0""C", temp_c);
+    } else {
+        snprintf(temp_str, sizeof(temp_str), "Temp: N/A");
+    }
+
     /* LCD */
-    esp_lcd_panel_io_handle_t lcd_io = NULL;
-    g_panel = lcd_init(&lcd_io);
+    g_panel = lcd_init(&g_lcd_io);
 
     /* Touch */
     esp_lcd_touch_handle_t touch = touch_init(g_i2c_bus);
@@ -391,7 +502,7 @@ void app_main(void)
     ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
 
     const lvgl_port_display_cfg_t disp_cfg = {
-        .io_handle     = lcd_io,
+        .io_handle     = g_lcd_io,
         .panel_handle  = g_panel,
         .buffer_size   = DRAW_BUF_SIZE / sizeof(uint16_t),
         .double_buffer = false,
@@ -409,7 +520,7 @@ void app_main(void)
 
     /* UI */
     lvgl_port_lock(0);
-    ui_create(disp, wake_str);
+    ui_create(disp, wake_str, temp_str);
     lvgl_port_unlock();
 
     ESP_LOGI(TAG, "UI ready — %s", wake_str);
